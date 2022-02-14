@@ -1,0 +1,462 @@
+---
+title: "QDNAseq_hg38_Bam2Plots for 30kbins"
+author: "Leticia G Leon"
+date: "03/08/2021"
+output: html_document
+---
+
+
+# Updated version from July 2021
+## What is new in this script (from the previous IntEnd scripts)
+#### include TBL calculation
+#### library xlsx is not working anymore (ajve problem in the server), so Outliers table is save as CSV (NO colors)
+#### This an example general code for 30kb
+## make a copy of this script and put wherever you need, and leave this copy here
+
+#### To install libraries if needed
+```{r install, message = FALSE, warning = FALSE}
+#knitr::opts_chunk$set(echo = TRUE)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+#BiocManager::install(c("CGHregions", "limma", "impute", "QDNAseq.dev", "QDNAseq.hg19", "string"))
+```
+### Libraries
+```{r  setup, include=FALSE}
+library(rmarkdown)
+library(QDNAseq, warn.conflicts=F, quietly=T)
+library(Biobase, warn.conflicts=F, quietly=T)
+library(R.cache, warn.conflicts=F, quietly=T)
+#library(QDNAseq.hg19, warn.conflicts=F, quietly=T)
+#more options, old part one c.raus
+library("future")
+plan(multiprocess)
+options(future.globals.maxSize= 1000000000)
+library(devtools)
+library(MASS)
+library(CGHregions)
+library(limma)
+library(impute)
+#library(QDNAseq.dev) #need for dewaving
+install_github("tgac-vumc/QDNAseq.dev", ref = "dewave")
+library(stringr)
+#library(xlsx)
+```
+
+### Functions
+```{r, functions, message = FALSE, warning = FALSE}
+
+# Function sampleNames: return the sample names from a QDNAseq object
+sampleNames <- function(largeQDNAseqCopyNumbers){
+  sampleNames <- {largeQDNAseqCopyNumbers@phenoData}@data$name
+  return(sampleNames)
+}
+
+# Function pathToScriptWithScriptname
+pathToScriptWithScriptname <- function() {
+  cmdArgs <- commandArgs(trailingOnly = FALSE)
+  needle <- "--file="
+  match <- grep(needle, cmdArgs)
+  if (length(match) > 0) {
+    # Rscript
+    return(normalizePath(sub(needle, "", cmdArgs[match])))
+  } else {
+    # 'source'd via R console
+    return(normalizePath(sys.frames()[[1]]$ofile))
+  }
+}
+
+```
+
+## Change the workdirectory
+### Set up working directory or where files/plots will be save or where your bams are, depens
+```{r wd, message = FALSE, warning = FALSE}
+setwd("/path to general directory/")
+```
+
+Setup Project Name, paths and folder names
+```{r paths, message = FALSE, warning = FALSE}
+pathToOutputDir <- "/path to general directory/"
+projectname <- "name_hg38_30kb"
+binSize <- 30 #15, 100, 100
+
+undoSD=1 # default in QDNAseq segmentation
+alpha=1e-10 # default in QDNAseq segmentation
+```
+
+
+```{r bam2smooth, message = FALSE, warning = FALSE}
+
+bin <- commandArgs(TRUE)[1]
+if (is.na(bin))
+  #bin <- 15
+  bin <- 30
+bin <- as.integer(bin)
+
+genome <- commandArgs(TRUE)[2]
+if (is.na(genome))
+    #genome <- "hg19"
+    genome <- "hg38"
+
+#library(QDNAseq)
+#library(Biobase)
+#library(R.cache)
+
+setCacheRootPath(path="./.Rcache")
+
+# Change to hg19 or hg38 as needed. With hg19 NO path is needed, only if we ran it before
+if(genome=="hg38"){
+  bins <- readRDS(paste("/apth to /cached-QDNAseq-binAnnotations_hg38/",bin,"k.rds",sep=""))
+  #bins <- readRDS(paste("/Users/l.gonzalez/Pipelines_tgo/hg38qdnaseqbinannotations/",bin,"k.rds",sep="")) # For hg38
+  #bins <- readRDS(paste("/Users/l.gonzalez/cached-QDNAseq-binAnnotations/",bin,"k.rds",sep="")) # For hg19
+} else{
+  bins <- getBinAnnotations(bin, genome=genome)
+}
+bins
+
+###Create the readCounts, using the bins and the bam 
+#QRC <- binReadCounts(bins, path='bam', cache=T)
+#QRC <- binReadCounts(bins, path='../testing_QDNAseq_Flow/bam/mkdup_2bam/', cache=T)
+QRC <- binReadCounts(bins, path='/path to bam//markdup_bam', cache=T)
+
+
+sub("(_[ACGT]+)?(_S\\d+)?(_L\\d{3})?_R\\d{1}_\\d{3}(\\.f(ast)?q\\.gz)?$", "", sampleNames(QRC)) -> samples
+
+if (sum(duplicated(samples)) > 0) {
+        QRC <- poolRuns(QRC, samples=samples, force=TRUE)
+}
+#Save the Raw bins
+saveRDS(QRC, paste(genome, ".", bin,"kbp-raw.rds", sep=""))
+
+QRC.f <- applyFilters(QRC, residual=TRUE, blacklist=TRUE, mappability=FALSE, bases=FALSE)
+#### There is no step for #estimateCorrection !!!!!! Filter and correct for GC contenct and create the Copy Number object
+QCN.fc <- correctBins(QRC.f) # This is the 1st Christian output 
+
+##### Second part of C.raush codes
+QCN.fcn <- normalizeBins(QCN.fc)
+##Smooth before dewaving
+QCN.fcns <- smoothOutlierBins(QCN.fcn)
+```
+
+#########################################################
+##Dewaving steps is here before the Smoothing
+#########################################################
+
+### Dewaving
+Here we need to select the one we want use and mute the others
+```{r dewaving, message = FALSE, warning = FALSE}
+library(QDNAseq.dev)
+#binSize == 15
+#NormalCalibrationSet_ofcurrentBinSize = NormalCalibrationSet_15kb
+#binSize == 30 
+NormalCalibrationSet_ofcurrentBinSize = NormalCalibrationSet_30kb
+#if(binSize == 50) 
+#NormalCalibrationSet_ofcurrentBinSize = NormalCalibrationSet_50kb
+#if(binSize == 100) 
+#NormalCalibrationSet_ofcurrentBinSize = NormalCalibrationSet_100kb
+#binSize == 1000
+#NormalCalibrationSet_ofcurrentBinSize = NormalCalibrationSet_1000kb
+ 
+QCN.fcnsDewaved = dewaveBins(QCN.fcns, NormalCalibrationSet_ofcurrentBinSize)
+QCN.fcns = QCN.fcnsDewaved
+```
+
+## Continue with the smoothing step and so on
+```{r calling, message = FALSE, warning = FALSE }
+#save the Smoothing, After dewaving we create the plots from here
+saveRDS(QCN.fcns, paste(genome, ".", bin, "kbp.rds", sep=""))
+
+##Segments
+#Create the segmented object and Normalized segments
+QCN.fcnss <- segmentBins(QCN.fcns)
+QCN.fcnssn <- normalizeSegmentedBins(QCN.fcnss)
+#Save segmented .rds object,
+saveRDS(QCN.fcnssn, paste(genome, ".", bin, "kbp-segmented.rds", sep=""))
+# export the the normalized log2 readcounts of the segments
+exportBins(QCN.fcnssn, "copyNumbersSegmented-30kb.tsv", format="tsv", type="segments")
+
+##Calls
+#Create the calls 
+QCN.fcnssnc <- callBins(QCN.fcnssn)
+
+#Save called object
+saveRDS(QCN.fcnssnc, paste(genome, ".", bin,"kbp-called.rds", sep=""))
+#save called RDs also Christian way, those fiels are the same one, jsut for checking
+saveRDS(QCN.fcnssnc,"copyNumbersCalled-30kb.rds")
+
+#Export bins of the calls (log2 readcounts of the calls)
+exportBins(QCN.fcnssnc, paste(genome, ".", bin, "kbp-copynumbers.tsv", sep=""), format="tsv", type="copynumber")
+exportBins(QCN.fcnssnc, paste(genome, ".", bin, "kbp-segments.igv", sep=""), format="igv", type="segments")
+exportBins(QCN.fcnssnc, paste(genome, ".", bin, "kbp-segments.tsv", sep=""), format="tsv", type="segments")
+exportBins(QCN.fcnssnc, paste(genome, ".", bin, "kbp-calls.igv", sep=""), format="igv", type="calls")
+exportBins(QCN.fcnssnc, paste(genome, ".", bin, "kbp-calls.tsv", sep=""), format="tsv", type="calls")
+
+
+#create CGHcall table and save
+cghcall <- makeCgh(QCN.fcnssnc)
+#try with cbind
+cghcall_df <- data.frame(cbind(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall), copynumber(cghcall), segmented(cghcall)))
+#####FUNCTION BPSTART IS NOT WORKING I NEED TO USE: cghcall@featureData@data$Start
+cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall), copynumber(cghcall), segmented(cghcall))
+#cghregions@featureData@data$Start
+
+#cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall))
+names(cghcall_df)[1] <- paste("Name")
+names(cghcall_df)[2] <- paste("Chromosome")
+names(cghcall_df)[3] <- paste("Start")
+names(cghcall_df)[4] <- paste("End")
+
+write.table(cghcall_df, "cghCall-df_copyNumbersCalled-30kb.tab",col.names=TRUE, row.names=FALSE,quote=F,sep="\t")
+
+```
+
+#```{r  cghcall, message = FALSE, warning = FALSE}
+#library(CGHregions)
+cghcall <- makeCgh(QCN.fcnssnc)
+
+#cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall), copynumber(cghcall), segmented(cghcall))
+cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall))
+names(cghcall_df)[1] <- paste("Name")
+names(cghcall_df)[2] <- paste("Chromosome")
+names(cghcall_df)[3] <- paste("Start")
+names(cghcall_df)[4] <- paste("End")
+#```
+
+This is to create the Frequency plot
+```{r FreqPlots, message=FALSE, warning=FALSE}
+frequencyPlot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="purple", delcol="darkblue")
+pdf(file=paste(pathToOutputDir, projectname, "-frequencyPlot-", binSize, "kb-bins.pdf", sep=""))
+frequencyPlot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="purple", delcol="darkblue")
+dev.off()
+
+plot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="purple", delcol="darkblue")
+plot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="grey", delcol="green")
+frequencyPlot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="purple", delcol="darkblue")
+frequencyPlot(QCN.fcnssnc, gaincol="red", losscol="blue", ampcol="darkred  ", delcol="green")
+```
+
+This is to create the folders and save the Called plots 
+```{r calledPlots, message = FALSE, warning = FALSE}
+##create the directory and make a plot for each file in the analysis
+
+calledPlotDir <- paste("/CalledPlot/")
+dir.create(calledPlotDir, showWarnings = FALSE, recursive=TRUE)
+for (i in 1:ncol(QCN.fcnssnc)) {
+  png.name <- paste(calledPlotDir, sampleNames(QCN.fcnssnc)[i], "_CalledPlot.png", sep="")
+  png(png.name, width = 1280, height = 1024)
+  plot(QCN.fcnssnc[,i], gaincol="red", losscol="blue", ampcol="darkred", delcol="darkblue")
+  dev.off()
+}
+```
+
+This is to create the folders and save the Segmented plots
+```{r SegmentsPlots, message = FALSE, warning = FALSE}
+##create the directory and make a plot for each file in the analysis
+
+segmentPlotDir <- paste(pathToOutputDir,"SegmentsPlot/", sep = "")
+dir.create(segmentPlotDir, showWarnings = FALSE, recursive=TRUE)
+for (i in 1:ncol(QCN.fcnssn)) {
+  png.name <- paste(segmentPlotDir, sampleNames(QCN.fcnssn)[i], "_SegmentPlot.png", sep="")
+  png(png.name, width = 1280, height = 1024)
+  plot(QCN.fcnssn[,i])
+  dev.off()
+}
+```
+
+
+This is to create the Stats folder and the files inside
+```{r  Stats, message = FALSE, warning = FALSE}
+# calculate statistics matrix:
+OutputDirStats <- paste(pathToOutputDir,"stats/", sep = "")
+dir.create(OutputDirStats, showWarnings = FALSE, recursive=TRUE)
+
+# get the path where this script is in:
+#currentpathToScriptWithScriptname = pathToScriptWithScriptname()
+
+#currentpathToScript = str_extract(string = currentpathToScriptWithScriptname , "/.*/")
+#currentpathToScript = str_extract(string = currentpathToScriptWithScriptname , "/.*/|.*\\\\") # /Unix/ OR C:\Windows\ style of path
+currentpathToScript <- "/home/l.gonzalez/Notebooks/bash_R_scripts/"
+
+# this code will take a copyNumbers-object as input, calculate segments, var_expect, var_observed, diffvar, total_reads and return them wrapped as dataframe statsDF
+#Use the whole path
+copyNumbersCalled <- QCN.fcnssnc
+#source(paste0(currentpathToScript, "QDNAseq-observedVariance.R"))
+source("/path to /QDNAseq-observedVariance.R")
+
+#Remove outliers
+#Use the whole path
+Outlier_removal_in_R_using_IQR_rule <- dget(paste0(currentpathToScript, "csv_Outlier_removal_in_R_using_IQR_rule.R"))
+#xlsOutputFile <- paste(projectname, "-statistics-", binSize, "kb-bins.csv", sep="")
+csvOutputFile <- paste("statistics", binSize, "kb.csv", sep="")
+Outlier_removal_in_R_using_IQR_rule(OutputDirStats, csvOutputFile, statsDF)
+
+```
+
+
+```{r cghregions, message = FALSE, warning = FALSE}
+
+# CGHregions: calculation of regions
+filenameOfCGHregionsOutput <- paste0(OutputDirStats, binSize, "kb.point01percentsmoothing.CGHregions.tab", sep = "")
+
+# copyNumbersCalled = readRDS(filenameOfCopyNumbersCalledRDSfile) # needed for importing copy numbers here. 
+# cghcall <- makeCgh(copyNumbersCalled) # this was done already above
+#cghregions_normalRegioning1percent <- CGHregions(cghcall, averror=0.01) # 1% error rate is considered "normal" according to CGHregions paper, when intending to compare groups
+#cghregions_lenientRegioningPoint01percent <- CGHregions(cghcall, averror=0.0001) # 0.01 % error rate will result in extremely lenient smoothing
+#cghregions_severeRegioning2point5percent <- CGHregions(cghcall, averror=0.025) # 2.5 % error rate will result in extremely dramatic smoothing, when intending to compare groups with <= 10 members
+cghregions <- CGHregions(cghcall, averror=0.0001) # =0.01 % error rate will result in extremely lenient smoothing
+
+#function bpstrat is not working, not getting the right vaue, instead os taking the whole cghRegions object
+#cghregions_df <- data_frame(chromosomes(cghregions), bpstart(cghregions), bpend(cghregions), nclone(cghregions), avedist(cghregions), regions(cghregions) )
+#cghregions_df <- data.frame(chromosomes(cghregions), bpstart(cghregions@featureData@data$Start), bpend(cghregions), nclone(cghregions), avedist(cghregions), regions(cghregions) )
+
+cghregions_df <- data.frame(chromosomes(cghregions), CGHbase::bpstart(cghregions), bpend(cghregions), nclone(cghregions), avedist(cghregions), regions(cghregions) )
+
+names(cghregions_df)[1] <- paste("Chromosome")
+names(cghregions_df)[2] <- paste("Start")
+names(cghregions_df)[3] <- paste("End")
+names(cghregions_df)[4] <- paste("nclone")
+names(cghregions_df)[5] <- paste("avedist")
+names(cghregions_df)[6] <- paste("regions")
+
+write.table(cghregions_df, filenameOfCGHregionsOutput, quote=F, sep="\t") 
+
+#loading the function and passing the arguments to the function
+CGHregionsDF2stats <- dget( "/path to/CGHregionsDF2stats_hg38.R")
+CGHregionsDF2stats(cghregions_df, binSize, filenameOfCGHregionsOutput)
+```
+
+This is to create a segment object to use in RUBIC but also to have the info that Soufyan needs
+```{r segments, warning=FALSE, message=FALSE  }
+
+#Using the cghcall dataframe that we created before
+#cghcall <- makeCgh(QCN.fcnssnc)
+#cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall), copynumber(cghcall), segmented(cghcall))
+#cghcall_df <- data.frame(featureNames(cghcall), chromosomes(cghcall), bpstart(cghcall), bpend(cghcall), calls(cghcall))
+#names(cghcall_df)[1] <- paste("Name")
+#names(cghcall_df)[2] <- paste("Chromosome")
+#names(cghcall_df)[3] <- paste("Start")
+#names(cghcall_df)[4] <- paste("End")
+samples=colnames(cghcall_df)[-c(1:4)]
+samples_shorter=gsub(".markdup$", "", samples, perl = T)
+samples=samples_shorter
+colnames(cghcall_df)[-c(1:4)]=samples
+
+
+markers=data.frame(cghcall_df$Name, cghcall_df$Chromosome, (cghcall_df$End+cghcall_df$Start-1)/2)
+colnames(markers)=c("Name", "Chromosome","Position")
+write.table(markers, "30kb_markers_batchD-Intend_GRCh38.tsv", sep = "\t", col.names = T, row.names = F, append = F, quote = F) 
+#write.table(markers, "30kb_markers_h38.tsv", sep = "\t", col.names = T, row.names = F, append = F, quote = F) 
+
+
+# start for loop over samples here
+
+shift <- function(x, n){
+  c(NA, x[-length(x)])
+}
+
+onedfsmall_colnames = paste("Sample", "Chromosome", "Start", "End", "MarkerCount", "LogRatio",sep="\t")
+#should be the same name here and at the end of the for loop, because we create the table and them we fill it
+write.table(onedfsmall_colnames, "30kb_segcna.tsv", sep="\t", quote=F, col.names = F, row.names = F, append = F)
+#write.table(onedfsmall_colnames, "30kb_segcna_h38.tsv", sep="\t", quote=F, col.names = F, row.names = F)
+
+
+for (sample in samples) {
+  # test: sample=samples[1]
+  onedf=cghcall_df[,c("Name", "Chromosome", "Start", "End", sample)]
+  
+  onedf$Chromosome=factor(onedf$Chromosome)
+  binSize=onedf$End[1]-onedf$Start[1]+1
+  
+  # in dataframe onedf: aggregate Start positions by Chromosome, using the min.
+  chrStart=aggregate(Start ~ Chromosome, data=onedf, FUN=min)
+  chrEnd=aggregate(End ~ Chromosome, data=onedf, FUN=max)
+  
+  chrStartEnd=data.frame(chrStart$Chromosome,chrStart$Start,chrEnd$End)
+  colnames(chrStartEnd)=c("Chromosome", "Start", "End")
+  
+  
+  colnames(onedf)[5]="logvalue"
+  
+ 
+  onedf$logvalueshift=onedf$logvalue
+  onedf$logvalueshift<- shift(onedf$logvalueshift, 1)
+  #rows = apply(onedf[, 5:6], 1, function(i) any(i[-1] != i[1])) # for more comparisons
+  rows = apply(onedf[, 5:6], 1, function(i) (i[1] != i[-1]))
+  rows[is.na(rows)] = TRUE
+  onedfsmall = onedf[rows,]
+  newend=NA
+  maxrow=dim(onedfsmall)[1]
+  
+  for (row in c(1:maxrow)) {
+    if(row<maxrow & onedfsmall$Chromosome[row]==onedfsmall$Chromosome[row+1]) {
+      if(onedfsmall$Chromosome[row]==onedfsmall$Chromosome[row+1]) {
+        onedfsmall$newend[row]=onedfsmall$Start[row+1]-1
+      }
+    }
+    else { # so the Chromosome of next row is different
+      onedfsmall$newend[row]=chrStartEnd$End[chrStartEnd$Chromosome==onedfsmall$Chromosome[row]]
+    }
+  }
+  
+  onedfsmall$Name=sample
+  # before setting sample names remove undesired suffix
+  sample_shorter=gsub(".markdup$", "", sample, perl = T)
+  sample=sample_shorter
+  onedfsmall$Name=sample
+  onedfsmall$End <- NULL
+  onedfsmall$logvalueshift <- NULL
+  onedfsmall$numberOfBins = (onedfsmall$newend-onedfsmall$Start+1)/binSize
+  
+  # End for loop around all samples
+  # colnames(onedfsmall) is: "Name"         "Chromosome"   "Start"        "logvalue"     "newend"       "numberOfBins"
+  # colnames(onedfsmall) is: "Sample"         "Chromosome"   "Start"        "LogRatio"     "End"       "MarkerCount"
+                            
+  # not needed: colnames have been written to output file already colnames(onedfsmall)= c("Sample", "Chromosome", "Start", "LogRatio", "End", "MarkerCount")
+  write.table(onedfsmall[,c(1,2,3,5,6,4)], "30kb_segcna.tsv", sep = "\t", col.names = F, row.names = F, append = T, quote = F)
+ # write.table(onedfsmall[,c(1,2,3,5,6,4)], "30kb_segcna_h38.tsv", sep = "\t", col.names = F, row.names = F, append = T, quote = F)
+}
+
+```
+
+#```{r TBL, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+source("/home/path to /breakFunctions-copy.R")
+#server
+#copyNumbersCalled=readRDS("/DATA/share/pipelines/lgleon/NGS_protocol/results_QDNAseq/NGSdata_hg38_30kb/hg38.30kbp-called.rds")
+#laptop
+#copyNumbersCalled=readRDS("/Users/l.gonzalez/NGS_protocol_data/results_hg38_QDNSeqFlow/NGSdata_hg38_30kb/hg38.30kbp-called.rds")
+
+#we already have this part
+#cghcall <- makeCgh(copyNumbersCalled)
+
+cghcall_tbl <- data.frame(Name = featureNames(cghcall), 
+                         Chromosome = chromosomes(cghcall), Start = CGHbase::bpstart(cghcall), 
+                         End = bpend(cghcall), segmented(cghcall)) #bpstart(cghcall@featureData@data$Start), 
+#this second part is just to remove .markdup from sample name
+samples=colnames(cghcall_tbl)[-c(1:4)]
+samples_shorter=gsub(".markdup$", "", samples, perl = T)
+samples=samples_shorter
+colnames(cghcall_tbl)[-c(1:4)] <- samples
+
+segment_tbl <- SegmentFormatConv(cghcall_tbl) # determine segments from segment data
+write.table(segment_tbl, "30kb_segment.tsv", sep = "\t")
+breakpoints_tbl <- calculateBreakpoints(segment_tbl) # calculate breakpoints and their properties
+write.table(breakpoints_tbl, "30kb_breakpoint.tsv", sep = "\t")
+pdf ("30kb_.pdf")
+bp_plot <- breakPropertyPlot(breakpoints_tbl)
+dev.off()
+bp_plot <- breakPropertyPlot(breakpoints_tbl)
+breakload_tbl <- bp_counting(breakpoints_tbl, 
+                            no_bp_sample = setdiff(unique(as.character(segment_tbl$Name)), 
+                                                   unique(as.character(breakpoints_tbl$sample))))
+write.table(breakload_tbl, "30kb_breakload.tsv", sep = "\t")
+
+```
+
+
+
+
+######### System info
+```{r}
+sessionInfo()
+Sys.info()
+```
